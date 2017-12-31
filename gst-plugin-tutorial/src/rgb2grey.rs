@@ -16,86 +16,52 @@ use gst_plugin::object::*;
 use gst_plugin::element::*;
 use gst_plugin::base_transform::*;
 
-use std::{cmp, iter, i32, u64};
+use std::i32;
 use std::sync::Mutex;
 
-const DEFAULT_MAX_DELAY: u64 = gst::SECOND_VAL;
-const DEFAULT_DELAY: u64 = 500 * gst::MSECOND_VAL;
-const DEFAULT_INTENSITY: f64 = 0.5;
-const DEFAULT_FEEDBACK: f64 = 0.0;
+const DEFAULT_STEPS: u32 = 256;
 
 #[derive(Debug, Clone, Copy)]
 struct Settings {
-    pub max_delay: u64,
-    pub delay: u64,
-    pub intensity: f64,
-    pub feedback: f64,
+    pub steps: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            max_delay: DEFAULT_MAX_DELAY,
-            delay: DEFAULT_DELAY,
-            intensity: DEFAULT_INTENSITY,
-            feedback: DEFAULT_FEEDBACK,
+            steps: DEFAULT_STEPS,
         }
     }
 }
 
 struct State {
-    info: gst_audio::AudioInfo,
-    buffer: RingBuffer,
+    out_info: gst_video::VideoInfo,
 }
 
-struct AudioEcho {
+struct Rgb2Grey {
     cat: gst::DebugCategory,
     settings: Mutex<Settings>,
     state: Mutex<Option<State>>,
 }
 
-static PROPERTIES: [Property; 4] = [
-    Property::UInt64(
-        "max-delay",
-        "Maximum Delay",
-        "Maximum delay of the echo in nanoseconds (can't be changed in PLAYING or PAUSED state)",
-        (0, u64::MAX),
-        DEFAULT_MAX_DELAY,
-        PropertyMutability::ReadWrite,
-    ),
-    Property::UInt64(
-        "delay",
-        "Delay",
-        "Delay of the echo in nanoseconds",
-        (0, u64::MAX),
-        DEFAULT_DELAY,
-        PropertyMutability::ReadWrite,
-    ),
-    Property::Double(
-        "intensity",
-        "Intensity",
-        "Intensity of the echo",
-        (0.0, 1.0),
-        DEFAULT_INTENSITY,
-        PropertyMutability::ReadWrite,
-    ),
-    Property::Double(
-        "feedback",
-        "Feedback",
-        "Amount of feedback",
-        (0.0, 1.0),
-        DEFAULT_FEEDBACK,
+static PROPERTIES: [Property; 1] = [
+    Property::UInt(
+        "steps",
+        "Number of Steps",
+        "Number of grey steps to use",
+        (1, 256),
+        DEFAULT_STEPS,
         PropertyMutability::ReadWrite,
     ),
 ];
 
-impl AudioEcho {
+impl Rgb2Grey {
     fn new(_transform: &BaseTransform) -> Self {
         Self {
             cat: gst::DebugCategory::new(
-                "rsaudiofx",
+                "rsrgb2grey",
                 gst::DebugColorFlags::empty(),
-                "Rust audiofx effect",
+                "Rust RGB-GREY converter",
             ),
             settings: Mutex::new(Default::default()),
             state: Mutex::new(None),
@@ -104,25 +70,31 @@ impl AudioEcho {
 
     fn class_init(klass: &mut BaseTransformClass) {
         klass.set_metadata(
-            "Audio echo",
-            "Filter/Effect/Audio",
-            "Adds an echo or reverb effect to an audio stream",
+            "RGB-GREY Converter",
+            "Filter/Effect/Converter/Video",
+            "Converts RGB to GREY or greyscale RGB",
             "Sebastian Dröge <sebastian@centricular.com>",
         );
 
         let caps = gst::Caps::new_simple(
-            "audio/x-raw",
+            "video/x-raw",
             &[
                 (
                     "format",
                     &gst::List::new(&[
-                        &gst_audio::AUDIO_FORMAT_F32.to_string(),
-                        &gst_audio::AUDIO_FORMAT_F64.to_string(),
+                        &gst_video::VideoFormat::Bgrx.to_string(),
+                        &gst_video::VideoFormat::Gray8.to_string(),
                     ]),
                 ),
-                ("rate", &gst::IntRange::<i32>::new(0, i32::MAX)),
-                ("channels", &gst::IntRange::<i32>::new(0, i32::MAX)),
-                ("layout", &"interleaved"),
+                ("width", &gst::IntRange::<i32>::new(0, i32::MAX)),
+                ("height", &gst::IntRange::<i32>::new(0, i32::MAX)),
+                (
+                    "framerate",
+                    &gst::FractionRange::new(
+                        gst::Fraction::new(0, 1),
+                        gst::Fraction::new(i32::MAX, 1),
+                    ),
+                ),
             ],
         );
         let src_pad_template = gst::PadTemplate::new(
@@ -133,6 +105,21 @@ impl AudioEcho {
         );
         klass.add_pad_template(src_pad_template);
 
+        let caps = gst::Caps::new_simple(
+            "video/x-raw",
+            &[
+                ("format", &gst_video::VideoFormat::Bgrx.to_string()),
+                ("width", &gst::IntRange::<i32>::new(0, i32::MAX)),
+                ("height", &gst::IntRange::<i32>::new(0, i32::MAX)),
+                (
+                    "framerate",
+                    &gst::FractionRange::new(
+                        gst::Fraction::new(0, 1),
+                        gst::Fraction::new(i32::MAX, 1),
+                    ),
+                ),
+            ],
+        );
         let sink_pad_template = gst::PadTemplate::new(
             "sink",
             gst::PadDirection::Sink,
@@ -143,51 +130,23 @@ impl AudioEcho {
 
         klass.install_properties(&PROPERTIES);
 
-        klass.configure(BaseTransformMode::AlwaysInPlace, false, false);
+        klass.configure(BaseTransformMode::NeverInPlace, false, false);
     }
 
     fn init(element: &BaseTransform) -> Box<BaseTransformImpl<BaseTransform>> {
         let imp = Self::new(element);
         Box::new(imp)
     }
-
-    fn process<F: Float + ToPrimitive + FromPrimitive>(
-        data: &mut [F],
-        state: &mut State,
-        settings: &Settings,
-    ) {
-        let delay_frames = (settings.delay as usize) * (state.info.channels() as usize)
-            * (state.info.rate() as usize) / (gst::SECOND_VAL as usize);
-
-        for (i, (o, e)) in data.iter_mut().zip(state.buffer.iter(delay_frames)) {
-            let inp = (*i).to_f64().unwrap();
-            let out = inp + settings.intensity * e;
-            *o = inp + settings.feedback * e;
-            *i = FromPrimitive::from_f64(out).unwrap();
-        }
-    }
 }
 
-impl ObjectImpl<BaseTransform> for AudioEcho {
+impl ObjectImpl<BaseTransform> for Rgb2Grey {
     fn set_property(&self, _obj: &glib::Object, id: u32, value: &glib::Value) {
         let prop = &PROPERTIES[id as usize];
 
         match *prop {
-            Property::UInt64("max-delay", ..) => {
+            Property::UInt("steps", ..) => {
                 let mut settings = self.settings.lock().unwrap();
-                settings.max_delay = value.get().unwrap();
-            }
-            Property::UInt64("delay", ..) => {
-                let mut settings = self.settings.lock().unwrap();
-                settings.delay = value.get().unwrap();
-            }
-            Property::Double("intensity", ..) => {
-                let mut settings = self.settings.lock().unwrap();
-                settings.intensity = value.get().unwrap();
-            }
-            Property::Double("feedback", ..) => {
-                let mut settings = self.settings.lock().unwrap();
-                settings.feedback = value.get().unwrap();
+                settings.steps = value.get().unwrap();
             }
             _ => unimplemented!(),
         }
@@ -197,37 +156,52 @@ impl ObjectImpl<BaseTransform> for AudioEcho {
         let prop = &PROPERTIES[id as usize];
 
         match *prop {
-            Property::UInt64("max-delay", ..) => {
+            Property::UInt("steps", ..) => {
                 let settings = self.settings.lock().unwrap();
-                if self.state.lock().unwrap().is_none() {
-                    Ok(settings.max_delay.to_value())
-                } else {
-                    Err(())
-                }
-            }
-            Property::UInt64("delay", ..) => {
-                let settings = self.settings.lock().unwrap();
-                Ok(settings.delay.to_value())
-            }
-            Property::Double("intensity", ..) => {
-                let settings = self.settings.lock().unwrap();
-                Ok(settings.intensity.to_value())
-            }
-            Property::Double("feedback", ..) => {
-                let settings = self.settings.lock().unwrap();
-                Ok(settings.feedback.to_value())
+                Ok(settings.steps.to_value())
             }
             _ => unimplemented!(),
         }
     }
 }
 
-impl ElementImpl<BaseTransform> for AudioEcho {}
+impl ElementImpl<BaseTransform> for Rgb2Grey {}
 
-impl BaseTransformImpl<BaseTransform> for AudioEcho {
-    fn transform_ip(&self, _element: &BaseTransform, buf: &mut gst::BufferRef) -> gst::FlowReturn {
+impl BaseTransformImpl<BaseTransform> for Rgb2Grey {
+    fn transform_caps(
+        &self,
+        _element: &BaseTransform,
+        direction: gst::PadDirection,
+        caps: gst::Caps,
+        filter: Option<&gst::Caps>,
+    ) -> gst::Caps {
+        let mut grey_caps = gst::Caps::new_empty();
+
+        {
+            let grey_caps = grey_caps.get_mut().unwrap();
+
+            for s in caps.iter() {
+                let mut s_grey = s.to_owned();
+                s_grey.set("format", &gst_video::VideoFormat::Gray8.to_string());
+                grey_caps.append_structure(s_grey);
+            }
+            grey_caps.append(caps);
+        }
+
+        if let Some(filter) = filter {
+            grey_caps.intersect_with_mode(filter, gst::CapsIntersectMode::First)
+        } else {
+            grey_caps
+        }
+    }
+
+    fn transform(
+        &self,
+        _element: &BaseTransform,
+        inbuf: &gst::Buffer,
+        outbuf: &mut gst::BufferRef,
+    ) -> gst::FlowReturn {
         let mut settings = *self.settings.lock().unwrap();
-        settings.delay = cmp::min(settings.max_delay, settings.delay);
 
         let mut state_guard = self.state.lock().unwrap();
         let state = match *state_guard {
@@ -235,44 +209,16 @@ impl BaseTransformImpl<BaseTransform> for AudioEcho {
             Some(ref mut state) => state,
         };
 
-        let mut map = match buf.map_writable() {
-            None => return gst::FlowReturn::Error,
-            Some(map) => map,
-        };
-
-        match state.info.format() {
-            gst_audio::AUDIO_FORMAT_F64 => {
-                let data = map.as_mut_slice().as_mut_slice_of::<f64>().unwrap();
-                Self::process(data, state, &settings);
-            }
-            gst_audio::AUDIO_FORMAT_F32 => {
-                let data = map.as_mut_slice().as_mut_slice_of::<f32>().unwrap();
-                Self::process(data, state, &settings);
-            }
-            _ => return gst::FlowReturn::NotNegotiated,
-        }
-
         gst::FlowReturn::Ok
     }
 
     fn set_caps(&self, _element: &BaseTransform, incaps: &gst::Caps, outcaps: &gst::Caps) -> bool {
-        if incaps != outcaps {
-            return false;
-        }
-
-        let info = match gst_audio::AudioInfo::from_caps(incaps) {
+        let info = match gst_video::VideoInfo::from_caps(outcaps) {
             None => return false,
             Some(info) => info,
         };
 
-        let max_delay = self.settings.lock().unwrap().max_delay;
-        let size = max_delay * (info.rate() as u64) / gst::SECOND_VAL;
-        let buffer_size = size * (info.channels() as u64);
-
-        *self.state.lock().unwrap() = Some(State {
-            info: info,
-            buffer: RingBuffer::new(buffer_size as usize),
-        });
+        *self.state.lock().unwrap() = Some(State { out_info: info });
 
         true
     }
@@ -285,99 +231,23 @@ impl BaseTransformImpl<BaseTransform> for AudioEcho {
     }
 }
 
-struct AudioEchoStatic;
+struct Rgb2GreyStatic;
 
-impl ImplTypeStatic<BaseTransform> for AudioEchoStatic {
+impl ImplTypeStatic<BaseTransform> for Rgb2GreyStatic {
     fn get_name(&self) -> &str {
-        "AudioEcho"
+        "Rgb2Grey"
     }
 
     fn new(&self, element: &BaseTransform) -> Box<BaseTransformImpl<BaseTransform>> {
-        AudioEcho::init(element)
+        Rgb2Grey::init(element)
     }
 
     fn class_init(&self, klass: &mut BaseTransformClass) {
-        AudioEcho::class_init(klass);
+        Rgb2Grey::class_init(klass);
     }
 }
 
 pub fn register(plugin: &gst::Plugin) {
-    let audioecho_static = AudioEchoStatic;
-    let type_ = register_type(audioecho_static);
-    gst::Element::register(plugin, "rsaudioecho", 0, type_);
-}
-
-struct RingBuffer {
-    buffer: Box<[f64]>,
-    pos: usize,
-}
-
-impl RingBuffer {
-    fn new(size: usize) -> Self {
-        let mut buffer = Vec::with_capacity(size as usize);
-        buffer.extend(iter::repeat(0.0).take(size as usize));
-
-        Self {
-            buffer: buffer.into_boxed_slice(),
-            pos: 0,
-        }
-    }
-
-    fn iter(&mut self, delay: usize) -> RingBufferIter {
-        RingBufferIter::new(self, delay)
-    }
-}
-
-struct RingBufferIter<'a> {
-    buffer: &'a mut [f64],
-    buffer_pos: &'a mut usize,
-    read_pos: usize,
-    write_pos: usize,
-}
-
-impl<'a> RingBufferIter<'a> {
-    fn new(buffer: &'a mut RingBuffer, delay: usize) -> RingBufferIter<'a> {
-        let size = buffer.buffer.len();
-
-        assert!(size >= delay);
-        assert_ne!(size, 0);
-
-        let read_pos = (size - delay + buffer.pos) % size;
-        let write_pos = buffer.pos % size;
-
-        let buffer_pos = &mut buffer.pos;
-        let buffer = &mut buffer.buffer;
-
-        RingBufferIter {
-            buffer: buffer,
-            buffer_pos: buffer_pos,
-            read_pos: read_pos,
-            write_pos: write_pos,
-        }
-    }
-}
-
-impl<'a> Iterator for RingBufferIter<'a> {
-    type Item = (&'a mut f64, f64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let res = unsafe {
-            let r = *self.buffer.get_unchecked(self.read_pos);
-            let w = self.buffer.get_unchecked_mut(self.write_pos);
-            // Cast needed to get from &mut f64 to &'a mut f64
-            (&mut *(w as *mut f64), r)
-        };
-
-        let size = self.buffer.len();
-        self.write_pos = (self.write_pos + 1) % size;
-        self.read_pos = (self.read_pos + 1) % size;
-
-        Some(res)
-    }
-}
-
-impl<'a> Drop for RingBufferIter<'a> {
-    fn drop(&mut self) {
-        *self.buffer_pos = self.write_pos;
-    }
+    let type_ = register_type(Rgb2GreyStatic);
+    gst::Element::register(plugin, "rsrgb2grey", 0, type_);
 }

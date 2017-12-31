@@ -15,7 +15,7 @@ extern crate gstreamer as gst;
 extern crate gstreamer_base as gst_base;
 extern crate gstreamer_video as gst_video;
 
-mod rgb2gray;
+mod rgb2grey;
 
 fn plugin_init(plugin: &gst::Plugin) -> bool {
     rgb2grey::register(plugin);
