@@ -173,10 +173,12 @@ impl BaseTransformImpl<BaseTransform> for Rgb2Grey {
         &self,
         _element: &BaseTransform,
         direction: gst::PadDirection,
-        mut caps: gst::Caps,
+        caps: &gst::Caps,
         filter: Option<&gst::Caps>,
     ) -> gst::Caps {
         let other_caps = if direction == gst::PadDirection::Src {
+            let mut caps = caps.clone();
+
             for s in caps.make_mut().iter_mut() {
                 s.set("format", &gst_video::VideoFormat::Bgrx.to_string());
             }
@@ -193,7 +195,7 @@ impl BaseTransformImpl<BaseTransform> for Rgb2Grey {
                     s_grey.set("format", &gst_video::VideoFormat::Gray8.to_string());
                     grey_caps.append_structure(s_grey);
                 }
-                grey_caps.append(caps);
+                grey_caps.append(caps.clone());
             }
 
             grey_caps
